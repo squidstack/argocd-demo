@@ -48,41 +48,58 @@ jobs:
           git config user.name "CloudBees Unify"
           git config user.email "noreply@cloudbees.com"
 
-          # Commit the change
-          COMMIT_TIME_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Check if there are changes to commit
           git add apps/demo-app/values-image.yaml
-          git commit -m "Update demo-app image tag to ${NEW_TAG}
+          if git diff --cached --quiet; then
+            echo ""
+            echo "⚠️  No changes detected - image tag is already ${NEW_TAG}"
+            echo "   Skipping commit, using current HEAD"
+            COMMIT_SHA=$(git rev-parse HEAD)
+            COMMIT_TIME_UTC=$(git log -1 --format=%cI HEAD)
+            ALREADY_DEPLOYED="true"
+          else
+            # Commit the change
+            COMMIT_TIME_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            git commit -m "Update demo-app image tag to ${NEW_TAG}
 
           Automated update via CloudBees Unify GitOps workflow
 
           Image: nginx:${NEW_TAG}
           Commit time: ${COMMIT_TIME_UTC}"
 
-          COMMIT_SHA=$(git rev-parse HEAD)
+            COMMIT_SHA=$(git rev-parse HEAD)
+            ALREADY_DEPLOYED="false"
+
+            echo ""
+            echo "✅ Git commit created:"
+            echo "   SHA: ${COMMIT_SHA}"
+            echo "   Time: ${COMMIT_TIME_UTC}"
+            echo "   Image: nginx:${NEW_TAG}"
+          fi
 
           # Save outputs for later steps
           printf '%s' "${COMMIT_SHA}" > "$CLOUDBEES_OUTPUTS/COMMIT_SHA"
           printf '%s' "${COMMIT_TIME_UTC}" > "$CLOUDBEES_OUTPUTS/COMMIT_TIME_UTC"
           printf '%s' "${NEW_TAG}" > "$CLOUDBEES_OUTPUTS/NEW_IMAGE_TAG"
-
-          echo ""
-          echo "✅ Git commit created:"
-          echo "   SHA: ${COMMIT_SHA}"
-          echo "   Time: ${COMMIT_TIME_UTC}"
-          echo "   Image: nginx:${NEW_TAG}"
+          printf '%s' "${ALREADY_DEPLOYED}" > "$CLOUDBEES_OUTPUTS/ALREADY_DEPLOYED"
 
       - name: Push to Git
         uses: docker://alpine/git:latest
         shell: sh
         env:
           CREATE_PR: ${{ inputs.create_pr }}
+          ALREADY_DEPLOYED: ${{ steps.git-update.outputs.ALREADY_DEPLOYED }}
         run: |
+          if [ "${ALREADY_DEPLOYED}" = "true" ]; then
+            echo "⚠️  No changes to push - tag already deployed"
+            exit 0
+          fi
+
           if [ "${CREATE_PR}" = "true" ]; then
             # Create branch and push for PR
             BRANCH_NAME="update-image-$(date +%s)"
             git checkout -b "${BRANCH_NAME}"
             git push origin "${BRANCH_NAME}"
-            echo "BRANCH_NAME=${BRANCH_NAME}" >> $CLOUDBEES_OUTPUTS/commit_info
             echo "✅ Pushed to branch: ${BRANCH_NAME}"
             echo ""
             echo "⚠️  PR Mode: Workflow will wait for PR merge before continuing"
