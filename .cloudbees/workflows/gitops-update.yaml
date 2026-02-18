@@ -27,6 +27,7 @@ jobs:
         uses: cloudbees-io/checkout@v1
 
       - name: Update image tag in Git
+        id: git-update
         uses: docker://alpine/git:latest
         shell: sh
         env:
@@ -59,10 +60,10 @@ jobs:
 
           COMMIT_SHA=$(git rev-parse HEAD)
 
-          # Save for evidence
-          echo "COMMIT_SHA=${COMMIT_SHA}" >> $CLOUDBEES_OUTPUTS/commit_info
-          echo "COMMIT_TIME_UTC=${COMMIT_TIME_UTC}" >> $CLOUDBEES_OUTPUTS/commit_info
-          echo "NEW_IMAGE_TAG=${NEW_TAG}" >> $CLOUDBEES_OUTPUTS/commit_info
+          # Save outputs for later steps
+          printf '%s' "${COMMIT_SHA}" > "$CLOUDBEES_OUTPUTS/COMMIT_SHA"
+          printf '%s' "${COMMIT_TIME_UTC}" > "$CLOUDBEES_OUTPUTS/COMMIT_TIME_UTC"
+          printf '%s' "${NEW_TAG}" > "$CLOUDBEES_OUTPUTS/NEW_IMAGE_TAG"
 
           echo ""
           echo "✅ Git commit created:"
@@ -110,11 +111,11 @@ jobs:
           ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
           POLL_INTERVAL: "5"
           POLL_TIMEOUT: "300"
+          COMMIT_SHA: ${{ steps.git-update.outputs.COMMIT_SHA }}
+          COMMIT_TIME_UTC: ${{ steps.git-update.outputs.COMMIT_TIME_UTC }}
+          NEW_IMAGE_TAG: ${{ steps.git-update.outputs.NEW_IMAGE_TAG }}
         run: |
           apk add --no-cache curl jq
-
-          # Read commit info
-          . $CLOUDBEES_OUTPUTS/commit_info || true
 
           echo "=== ArgoCD GitOps Orchestration ==="
           echo "Server: ${ARGOCD_SERVER}"
@@ -170,15 +171,13 @@ jobs:
               echo "   Total Lag: ${TOTAL_LAG} seconds (refresh → synced)"
 
               # Save outputs for evidence
-              {
-                echo "SYNC_STATUS=${SYNC_STATUS}"
-                echo "HEALTH_STATUS=${HEALTH_STATUS}"
-                echo "OPERATION_PHASE=${OPERATION_PHASE}"
-                echo "REFRESH_TIME_UTC=${REFRESH_TIME_UTC}"
-                echo "SYNC_FINISHED_UTC=${SYNC_FINISHED_UTC}"
-                echo "POLL_ATTEMPTS=${POLL_COUNT}"
-                echo "TOTAL_LAG_SECONDS=${TOTAL_LAG}"
-              } >> $CLOUDBEES_OUTPUTS/argocd_status
+              printf '%s' "${SYNC_STATUS}" > "$CLOUDBEES_OUTPUTS/SYNC_STATUS"
+              printf '%s' "${HEALTH_STATUS}" > "$CLOUDBEES_OUTPUTS/HEALTH_STATUS"
+              printf '%s' "${OPERATION_PHASE}" > "$CLOUDBEES_OUTPUTS/OPERATION_PHASE"
+              printf '%s' "${REFRESH_TIME_UTC}" > "$CLOUDBEES_OUTPUTS/REFRESH_TIME_UTC"
+              printf '%s' "${SYNC_FINISHED_UTC}" > "$CLOUDBEES_OUTPUTS/SYNC_FINISHED_UTC"
+              printf '%s' "${POLL_COUNT}" > "$CLOUDBEES_OUTPUTS/POLL_ATTEMPTS"
+              printf '%s' "${TOTAL_LAG}" > "$CLOUDBEES_OUTPUTS/TOTAL_LAG_SECONDS"
 
               break
             fi
@@ -198,13 +197,21 @@ jobs:
 
       - name: Generate evidence
         if: always()
+        id: evidence
         uses: docker://alpine:3.20
         shell: sh
+        env:
+          NEW_IMAGE_TAG: ${{ steps.git-update.outputs.NEW_IMAGE_TAG }}
+          COMMIT_SHA: ${{ steps.git-update.outputs.COMMIT_SHA }}
+          COMMIT_TIME_UTC: ${{ steps.git-update.outputs.COMMIT_TIME_UTC }}
+          SYNC_STATUS: ${{ steps.argocd.outputs.SYNC_STATUS }}
+          HEALTH_STATUS: ${{ steps.argocd.outputs.HEALTH_STATUS }}
+          OPERATION_PHASE: ${{ steps.argocd.outputs.OPERATION_PHASE }}
+          REFRESH_TIME_UTC: ${{ steps.argocd.outputs.REFRESH_TIME_UTC }}
+          SYNC_FINISHED_UTC: ${{ steps.argocd.outputs.SYNC_FINISHED_UTC }}
+          POLL_ATTEMPTS: ${{ steps.argocd.outputs.POLL_ATTEMPTS }}
+          TOTAL_LAG_SECONDS: ${{ steps.argocd.outputs.TOTAL_LAG_SECONDS }}
         run: |
-          # Read all outputs
-          . $CLOUDBEES_OUTPUTS/commit_info || true
-          . $CLOUDBEES_OUTPUTS/argocd_status || true
-
           {
             echo "# ArgoCD GitOps Deployment Evidence"
             echo ""
@@ -288,5 +295,5 @@ jobs:
         if: always()
         uses: cloudbees-io/publish-evidence-item@v1
         with:
-          content: ${{ steps.argocd.outputs.EVIDENCE }}
+          content: ${{ steps.evidence.outputs.EVIDENCE }}
           format: MARKDOWN
