@@ -1,0 +1,4 @@
+# Environment-specific values for dev
+content:
+  version: "1.0.0"
+  message: "Hello from ArgoCD Demo - DEV Environment!"

@@ -1,0 +1,3 @@
+# Image tag override - Updated by CloudBees Unify workflow
+image:
+  tag: "1.25.0"
