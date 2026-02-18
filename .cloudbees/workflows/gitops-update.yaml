@@ -1,0 +1,292 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: ArgoCD GitOps Update Demo
+on:
+  workflow_dispatch:
+    inputs:
+      new_image_tag:
+        type: string
+        required: true
+        default: "1.25.1"
+        description: "New nginx image tag to deploy (e.g., 1.25.1, 1.25.2)"
+      create_pr:
+        type: string
+        required: false
+        default: "false"
+        description: "Create PR instead of direct commit (true/false)"
+
+permissions:
+  scm-token-own: read
+  scm-token-org: read
+  id-token: write
+
+jobs:
+  gitops-update:
+    steps:
+      - name: Checkout GitOps repo
+        uses: cloudbees-io/checkout@v1
+
+      - name: Update image tag in Git
+        uses: docker://alpine/git:latest
+        shell: sh
+        env:
+          NEW_TAG: ${{ inputs.new_image_tag }}
+        run: |
+          apk add --no-cache yq
+
+          echo "=== Updating image tag to ${NEW_TAG} ==="
+
+          # Update values-image.yaml using yq
+          yq e ".image.tag = env(NEW_TAG)" -i apps/demo-app/values-image.yaml
+
+          # Show the change
+          echo "Updated values-image.yaml:"
+          cat apps/demo-app/values-image.yaml
+
+          # Configure git
+          git config user.name "CloudBees Unify"
+          git config user.email "noreply@cloudbees.com"
+
+          # Commit the change
+          COMMIT_TIME_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git add apps/demo-app/values-image.yaml
+          git commit -m "Update demo-app image tag to ${NEW_TAG}
+
+          Automated update via CloudBees Unify GitOps workflow
+
+          Image: nginx:${NEW_TAG}
+          Commit time: ${COMMIT_TIME_UTC}"
+
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          # Save for evidence
+          echo "COMMIT_SHA=${COMMIT_SHA}" >> $CLOUDBEES_OUTPUTS/commit_info
+          echo "COMMIT_TIME_UTC=${COMMIT_TIME_UTC}" >> $CLOUDBEES_OUTPUTS/commit_info
+          echo "NEW_IMAGE_TAG=${NEW_TAG}" >> $CLOUDBEES_OUTPUTS/commit_info
+
+          echo ""
+          echo "✅ Git commit created:"
+          echo "   SHA: ${COMMIT_SHA}"
+          echo "   Time: ${COMMIT_TIME_UTC}"
+          echo "   Image: nginx:${NEW_TAG}"
+
+      - name: Push to Git
+        uses: docker://alpine/git:latest
+        shell: sh
+        env:
+          CREATE_PR: ${{ inputs.create_pr }}
+        run: |
+          if [ "${CREATE_PR}" = "true" ]; then
+            # Create branch and push for PR
+            BRANCH_NAME="update-image-$(date +%s)"
+            git checkout -b "${BRANCH_NAME}"
+            git push origin "${BRANCH_NAME}"
+            echo "BRANCH_NAME=${BRANCH_NAME}" >> $CLOUDBEES_OUTPUTS/commit_info
+            echo "✅ Pushed to branch: ${BRANCH_NAME}"
+            echo ""
+            echo "⚠️  PR Mode: Workflow will wait for PR merge before continuing"
+            echo "   Create and merge PR manually, then re-run workflow with create_pr=false"
+            exit 0
+          else
+            # Direct push to main
+            git push origin main
+            echo "✅ Pushed to main branch"
+          fi
+
+      - name: Wait for Git propagation
+        uses: docker://alpine:3.20
+        shell: sh
+        run: |
+          echo "Waiting 5 seconds for Git changes to propagate..."
+          sleep 5
+
+      - name: Trigger ArgoCD refresh and poll status
+        id: argocd
+        uses: docker://alpine:3.20
+        shell: sh
+        env:
+          ARGOCD_SERVER: argocd.aib-unify-demo.sa-demo.beescloud.com
+          ARGOCD_APP_NAME: demo-app-dev
+          ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          POLL_INTERVAL: "5"
+          POLL_TIMEOUT: "300"
+        run: |
+          apk add --no-cache curl jq
+
+          # Read commit info
+          . $CLOUDBEES_OUTPUTS/commit_info || true
+
+          echo "=== ArgoCD GitOps Orchestration ==="
+          echo "Server: ${ARGOCD_SERVER}"
+          echo "Application: ${ARGOCD_APP_NAME}"
+          echo "Commit SHA: ${COMMIT_SHA}"
+          echo ""
+
+          # Trigger refresh
+          REFRESH_TIME_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "=== Triggering ArgoCD refresh at ${REFRESH_TIME_UTC} ==="
+
+          curl -sSk -X POST \
+            "https://${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}/refresh" \
+            -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+            -H "Content-Type: application/json" || {
+            echo "⚠️  Refresh call failed, but continuing (app may auto-sync)"
+          }
+
+          echo "✅ Refresh triggered"
+          echo ""
+
+          # Poll until Synced
+          echo "=== Polling for Synced status (timeout: ${POLL_TIMEOUT}s, interval: ${POLL_INTERVAL}s) ==="
+
+          POLL_START=$(date +%s)
+          POLL_COUNT=0
+          MAX_ATTEMPTS=$((POLL_TIMEOUT / POLL_INTERVAL))
+
+          while [ $POLL_COUNT -lt $MAX_ATTEMPTS ]; do
+            POLL_COUNT=$((POLL_COUNT + 1))
+
+            # Get application status
+            APP_STATUS=$(curl -sSk \
+              "https://${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}" \
+              -H "Authorization: Bearer ${ARGOCD_TOKEN}" || echo "{}")
+
+            SYNC_STATUS=$(echo "${APP_STATUS}" | jq -r '.status.sync.status // "Unknown"')
+            HEALTH_STATUS=$(echo "${APP_STATUS}" | jq -r '.status.health.status // "Unknown"')
+            OPERATION_PHASE=$(echo "${APP_STATUS}" | jq -r '.status.operationState.phase // "None"')
+
+            echo "Poll #${POLL_COUNT}: Sync=${SYNC_STATUS}, Health=${HEALTH_STATUS}, Operation=${OPERATION_PHASE}"
+
+            if [ "${SYNC_STATUS}" = "Synced" ]; then
+              SYNC_FINISHED_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              POLL_END=$(date +%s)
+              TOTAL_LAG=$((POLL_END - POLL_START))
+
+              echo ""
+              echo "✅ Application synced successfully!"
+              echo "   Sync Status: ${SYNC_STATUS}"
+              echo "   Health Status: ${HEALTH_STATUS}"
+              echo "   Sync Finished: ${SYNC_FINISHED_UTC}"
+              echo "   Total Lag: ${TOTAL_LAG} seconds (refresh → synced)"
+
+              # Save outputs for evidence
+              {
+                echo "SYNC_STATUS=${SYNC_STATUS}"
+                echo "HEALTH_STATUS=${HEALTH_STATUS}"
+                echo "OPERATION_PHASE=${OPERATION_PHASE}"
+                echo "REFRESH_TIME_UTC=${REFRESH_TIME_UTC}"
+                echo "SYNC_FINISHED_UTC=${SYNC_FINISHED_UTC}"
+                echo "POLL_ATTEMPTS=${POLL_COUNT}"
+                echo "TOTAL_LAG_SECONDS=${TOTAL_LAG}"
+              } >> $CLOUDBEES_OUTPUTS/argocd_status
+
+              break
+            fi
+
+            if [ $POLL_COUNT -lt $MAX_ATTEMPTS ]; then
+              sleep ${POLL_INTERVAL}
+            fi
+          done
+
+          # Check if we timed out
+          if [ "${SYNC_STATUS}" != "Synced" ]; then
+            echo ""
+            echo "❌ Timeout waiting for sync (${POLL_TIMEOUT}s elapsed)"
+            echo "   Last status: Sync=${SYNC_STATUS}, Health=${HEALTH_STATUS}"
+            exit 1
+          fi
+
+      - name: Generate evidence
+        if: always()
+        uses: docker://alpine:3.20
+        shell: sh
+        run: |
+          # Read all outputs
+          . $CLOUDBEES_OUTPUTS/commit_info || true
+          . $CLOUDBEES_OUTPUTS/argocd_status || true
+
+          {
+            echo "# ArgoCD GitOps Deployment Evidence"
+            echo ""
+            echo "## Summary"
+            echo ""
+            echo "**GitOps Pattern:** Unify updates Git → ArgoCD pulls and applies"
+            echo ""
+            echo "**Status:** ${SYNC_STATUS:-Unknown} / ${HEALTH_STATUS:-Unknown}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Git Update"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Image Tag** | nginx:${NEW_IMAGE_TAG} |"
+            echo "| **Commit SHA** | \`${COMMIT_SHA}\` |"
+            echo "| **Commit Time** | ${COMMIT_TIME_UTC} |"
+            echo "| **Repository** | https://github.com/squidstack/argocd-demo |"
+            echo "| **File Updated** | \`apps/demo-app/values-image.yaml\` |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## ArgoCD Orchestration"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Application** | demo-app-dev |"
+            echo "| **Namespace** | argocd-demo |"
+            echo "| **Refresh Triggered** | ${REFRESH_TIME_UTC:-N/A} |"
+            echo "| **Sync Status** | ${SYNC_STATUS:-Unknown} |"
+            echo "| **Health Status** | ${HEALTH_STATUS:-Unknown} |"
+            echo "| **Operation Phase** | ${OPERATION_PHASE:-None} |"
+            echo "| **Sync Finished** | ${SYNC_FINISHED_UTC:-N/A} |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Performance Metrics"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| **Poll Attempts** | ${POLL_ATTEMPTS:-N/A} |"
+            echo "| **Poll Interval** | 5 seconds |"
+            echo "| **Total Lag** | ${TOTAL_LAG_SECONDS:-N/A} seconds |"
+            echo "| **ArgoCD Reconcile** | Bypassed via refresh |"
+            echo ""
+            echo "> **Note:** Refresh eliminates waiting for ArgoCD's reconciliation interval (typically 3 minutes)"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Key Benefits"
+            echo ""
+            echo "✅ **GitOps Compliance:** All changes via Git (audit trail)"
+            echo ""
+            echo "✅ **Pull Model Preserved:** ArgoCD pulls from Git, Unify doesn't push to cluster"
+            echo ""
+            echo "✅ **Zero Reconciliation Delay:** Refresh triggers immediate sync"
+            echo ""
+            echo "✅ **Orchestration Evidence:** Complete timing and status capture"
+            echo ""
+            echo "✅ **Separation of Concerns:** Image updates isolated in values-image.yaml"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## ArgoCD Application"
+            echo ""
+            echo "[View in ArgoCD UI](https://argocd.aib-unify-demo.sa-demo.beescloud.com/applications/demo-app-dev)"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Workflow Details"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Workflow Run** | [${{ cloudbees.run_id }}](${{ cloudbees.api.url }}/app/rest/run/${{ cloudbees.run_id }}) |"
+            echo "| **Triggered By** | ${{ cloudbees.actor }} |"
+            echo "| **Workflow Name** | ${{ cloudbees.workflow_name }} |"
+          } > "$CLOUDBEES_OUTPUTS/EVIDENCE"
+
+      - name: Publish evidence
+        if: always()
+        uses: cloudbees-io/publish-evidence-item@v1
+        with:
+          content: ${{ steps.argocd.outputs.EVIDENCE }}
+          format: MARKDOWN
