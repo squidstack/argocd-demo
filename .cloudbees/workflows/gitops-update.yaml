@@ -280,8 +280,8 @@ jobs:
             echo "| Field | Value |"
             echo "|-------|-------|"
             echo "| **Workflow Run** | [${{ cloudbees.run_id }}](${{ cloudbees.api.url }}/app/rest/run/${{ cloudbees.run_id }}) |"
-            echo "| **Triggered By** | ${{ cloudbees.actor }} |"
-            echo "| **Workflow Name** | ${{ cloudbees.workflow_name }} |"
+            echo "| **Triggered Via** | ${{ cloudbees.event_name }} |"
+            echo "| **Run Number** | ${{ cloudbees.run_number }} |"
           } > "$CLOUDBEES_OUTPUTS/EVIDENCE"
 
       - name: Publish evidence
